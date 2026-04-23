@@ -1,10 +1,10 @@
 from tempfile import NamedTemporaryFile
 from typing import Optional, Any
+from functools import lru_cache
 
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from docling.document_converter import DocumentConverter
 
 
 class ParseRequest(BaseModel):
@@ -15,7 +15,14 @@ class ParseRequest(BaseModel):
 
 
 app = FastAPI(title="Docling Parser")
-converter = DocumentConverter()
+
+
+@lru_cache(maxsize=1)
+def get_converter() -> Any:
+    # Lazy init prevents slow model loading from blocking server port binding on startup.
+    from docling.document_converter import DocumentConverter
+
+    return DocumentConverter()
 
 
 @app.get("/healthz")
@@ -35,7 +42,7 @@ def parse_document(payload: ParseRequest) -> dict[str, Any]:
         tmp.write(response.content)
         tmp.flush()
         try:
-            result = converter.convert(tmp.name)
+            result = get_converter().convert(tmp.name)
         except Exception as exc:
             raise HTTPException(status_code=422, detail=f"Docling conversion failed: {exc}") from exc
 
