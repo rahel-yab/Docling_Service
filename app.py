@@ -23,6 +23,15 @@ class ParseRequest(BaseModel):
 app = FastAPI(title="Docling Parser")
 
 
+def _guess_document_suffix(*values: str | None) -> str:
+    joined = " ".join(value.lower() for value in values if value)
+    if ".docx" in joined or "officedocument.wordprocessingml.document" in joined:
+        return ".docx"
+    if ".doc" in joined or "msword" in joined:
+        return ".doc"
+    return ".pdf"
+
+
 @lru_cache(maxsize=1)
 def get_converter() -> Any:
     # Lazy init prevents slow model loading from blocking server port binding on startup.
@@ -40,11 +49,14 @@ def healthz() -> dict[str, str]:
 async def parse_document(request: Request) -> dict[str, Any]:
     content_type = request.headers.get("content-type", "")
     payload: ParseRequest | None = None
-    uploaded_pdf: Any | None = None
+    uploaded_document: Any | None = None
+    uploaded_file_name: str | None = None
 
     if "multipart/form-data" in content_type:
         form = await request.form()
-        uploaded_pdf = form.get("document_file") or form.get("file") or form.get("pdf")
+        uploaded_document = form.get("document_file") or form.get("file") or form.get("pdf")
+        if uploaded_document is not None:
+            uploaded_file_name = getattr(uploaded_document, "filename", None)
 
         document_url = form.get("document_url")
         if document_url:
@@ -65,13 +77,13 @@ async def parse_document(request: Request) -> dict[str, Any]:
     if payload is None or (
         payload.document_url is None
         and payload.file_base64 is None
-        and uploaded_pdf is None
+        and uploaded_document is None
     ):
         raise HTTPException(
             status_code=422,
             detail=(
                 "Provide either document_url (or source_path), file_base64, "
-                "or an uploaded PDF as document_file/file/pdf."
+                "or an uploaded document as document_file/file/pdf."
             ),
         )
 
@@ -103,7 +115,8 @@ async def parse_document(request: Request) -> dict[str, Any]:
 
         pdf_bytes = response.content
         content_type = response.headers.get("content-type", "").lower()
-        if "pdf" not in content_type and not pdf_bytes.startswith(b"%PDF"):
+        suffix = _guess_document_suffix(payload.file_name, content_type, payload.document_url)
+        if suffix == ".pdf" and "pdf" not in content_type and not pdf_bytes.startswith(b"%PDF"):
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -116,19 +129,25 @@ async def parse_document(request: Request) -> dict[str, Any]:
         try:
             pdf_bytes = base64.b64decode(payload.file_base64, validate=True)
         except (BinasciiError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail=f"Invalid base64 PDF payload: {exc}") from exc
-    elif uploaded_pdf is not None:
-        pdf_bytes = await uploaded_pdf.read()
+            raise HTTPException(status_code=400, detail=f"Invalid base64 document payload: {exc}") from exc
+    elif uploaded_document is not None:
+        pdf_bytes = await uploaded_document.read()
     else:
         raise HTTPException(
             status_code=422,
             detail=(
                 "Missing document input. Provide document_url (or source_path), "
-                "file_base64, or upload a PDF as document_file/file/pdf."
+                "file_base64, or upload a document as document_file/file/pdf."
             ),
         )
 
-    with NamedTemporaryFile(suffix=".pdf", delete=True) as tmp:
+    temp_suffix = _guess_document_suffix(
+        payload.file_name if payload else None,
+        uploaded_file_name,
+        payload.document_url if payload else None,
+    )
+
+    with NamedTemporaryFile(suffix=temp_suffix, delete=True) as tmp:
         tmp.write(pdf_bytes)
         tmp.flush()
         try:
